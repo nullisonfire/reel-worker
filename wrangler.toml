@@ -1,0 +1,34 @@
+#:schema node_modules/wrangler/config-schema.json
+name = "reels"
+main = "src/worker.js"
+compatibility_date = "2026-08-01"
+workers_dev = true
+
+# No build step, no dependencies. `wrangler deploy` and you're live.
+
+[observability]
+enabled = true
+
+[vars]
+# Successful lookups are cached this long (seconds). Meta's CDN URLs are
+# signed and expire in hours, so keep this well under that.
+CACHE_TTL = "1800"
+# Per-IP requests per minute. Only enforced when the RATELIMIT KV namespace
+# below is uncommented. Set to "0" to disable.
+RATE_LIMIT = "60"
+
+# ---------------------------------------------------------------------------
+# Optional: per-IP rate limiting.
+#   wrangler kv namespace create RATELIMIT
+# then paste the returned id below and uncomment.
+# ---------------------------------------------------------------------------
+# [[kv_namespaces]]
+# binding = "RATELIMIT"
+# id = "<your-kv-namespace-id>"
+
+# ---------------------------------------------------------------------------
+# Secrets — never put these in this file. Use:
+#   wrangler secret put API_KEY        # require X-API-Key on every request
+#   wrangler secret put IG_COOKIE      # unlocks play_count / audio / reshares
+#   wrangler secret put PROXY_SECRET   # enables the signed /media passthrough
+# ---------------------------------------------------------------------------

@@ -1,0 +1,14 @@
+{
+  "name": "reel",
+  "version": "1.0.0",
+  "description": "A single-file Cloudflare Worker that resolves an Instagram or Facebook reel URL into direct CDN media URLs plus metadata.",
+  "main": "worker.js",
+  "scripts": {
+    "deploy": "wrangler deploy",
+    "dev": "wrangler dev"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs"
+}

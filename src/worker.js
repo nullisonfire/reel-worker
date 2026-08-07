@@ -564,15 +564,52 @@ function parseIsoDuration(iso) {
 }
 
 /**
- * Instagram's DASH manifest is the richest source we get anonymously: exact
- * duration plus a per-quality list of progressive BaseURLs (up to 1080p),
- * which the flat video_versions array does not label.
+ * Every Meta CDN URL carries an `efg` query param: base64url-encoded JSON that
+ * self-describes the rendition. Verified example:
+ *   {"vencode_tag":"ig-xpvds.clips.igwww-C3.dash_ln_heaac_vbr3_audio",
+ *    "duration_s":12,"bitrate":59805,"urlgen_source":"www", …}
+ *
+ * `vencode_tag` is authoritative about what the URL actually contains, which
+ * makes it a better signal than guessing from the manifest alone:
+ *   …dash_ln_heaac_vbr3_audio      -> audio only
+ *   …xpv_progressive.…             -> muxed video + audio
+ *   …dash_vp9-basic-gen2_1080p     -> video only
+ */
+function decodeEfg(url) {
+  try {
+    const raw = /[?&]efg=([^&]+)/.exec(url)?.[1];
+    if (!raw) return null;
+    let b64 = decodeURIComponent(raw).replace(/-/g, '+').replace(/_/g, '/');
+    b64 += '='.repeat((4 - (b64.length % 4)) % 4);
+    return JSON.parse(atob(b64));
+  } catch {
+    return null;
+  }
+}
+
+const isProgressiveTag = (tag) => /progressive/i.test(tag || '');
+const isAudioTag = (tag) => /_audio\b|heaac|\baudio$/i.test(tag || '');
+
+/**
+ * Instagram's DASH manifest carries exact duration plus the full quality
+ * ladder up to 1080p — but those renditions are ADAPTIVE, meaning video and
+ * audio are separate streams. Confirmed with ffprobe against live URLs:
+ *
+ *   video_versions[0]        h264 716x1274 + aac   (muxed, plays as-is)
+ *   DASH 1080p BaseURL       vp9  1076x1914        (VIDEO ONLY, silent)
+ *   DASH audio BaseURL       aac stereo            (AUDIO ONLY)
+ *
+ * So the highest resolution Instagram offers is silent on its own, and the
+ * only ready-to-play file is the 720p progressive one. Callers need to know
+ * which is which, hence `kind` and `has_audio` on every format.
  */
 function parseDashManifest(xml) {
-  if (!xml || typeof xml !== 'string') return { duration: null, formats: [] };
+  const empty = { duration: null, video: [], audio: [] };
+  if (!xml || typeof xml !== 'string') return empty;
 
   const duration = parseIsoDuration(/mediaPresentationDuration="([^"]+)"/.exec(xml)?.[1]);
-  const formats = [];
+  const video = [];
+  const audio = [];
 
   for (const rep of xml.matchAll(/<Representation\b([^>]*)>([\s\S]*?)<\/Representation>/g)) {
     const attrs = rep[1];
@@ -581,20 +618,47 @@ function parseDashManifest(xml) {
     // The leading boundary matters: a bare /width="/ also matches the tail of
     // bandwidth="828641", which silently produced absurd dimensions.
     const attr = (name) => new RegExp(`(?:^|\\s)${name}="([^"]*)"`).exec(attrs)?.[1] || null;
+    const num = (name) => (attr(name) ? Number(attr(name)) : null);
+
+    const url = decodeHtmlEntities(baseUrl.trim());
     const mime = attr('mimeType') || '';
-    if (!mime.startsWith('video')) continue;
-    formats.push({
-      quality: attr('FBQualityLabel'),
-      width: attr('width') ? Number(attr('width')) : null,
-      height: attr('height') ? Number(attr('height')) : null,
-      bandwidth: attr('bandwidth') ? Number(attr('bandwidth')) : null,
-      codecs: attr('codecs'),
-      url: decodeHtmlEntities(baseUrl.trim()),
-    });
+    const tag = decodeEfg(url)?.vencode_tag || null;
+    const audioOnly = mime.startsWith('audio') || isAudioTag(tag);
+
+    if (audioOnly) {
+      audio.push({
+        kind: 'audio_only',
+        has_audio: true,
+        bitrate: num('bandwidth'),
+        codecs: attr('codecs'),
+        mime_type: mime || 'audio/mp4',
+        url,
+      });
+    } else if (mime.startsWith('video')) {
+      video.push({
+        quality: attr('FBQualityLabel'),
+        width: num('width'),
+        height: num('height'),
+        bitrate: num('bandwidth'),
+        codecs: attr('codecs'),
+        mime_type: mime,
+        // Set definitively below, once we know whether the manifest is split.
+        kind: isProgressiveTag(tag) ? 'progressive' : 'video_only',
+        has_audio: isProgressiveTag(tag),
+        url,
+      });
+    }
   }
 
-  formats.sort((a, b) => (b.height || 0) - (a.height || 0) || (b.bandwidth || 0) - (a.bandwidth || 0));
-  return { duration, formats };
+  // A manifest containing standalone audio is adaptive by definition, so every
+  // video rendition in it is silent regardless of what its tag implied.
+  if (audio.length) {
+    for (const f of video) { f.kind = 'video_only'; f.has_audio = false; }
+  }
+
+  video.sort((a, b) => (b.height || 0) - (a.height || 0) || (b.bitrate || 0) - (a.bitrate || 0));
+  audio.sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
+  return { duration, video, audio };
 }
 
 /** Widest available still, falling back to the video's first frame. */
@@ -607,17 +671,88 @@ const bestImage = (node) => {
 /** One carousel slide / single media -> the shape used in `media_list`. */
 function normaliseIgNode(node) {
   const isVideo = node?.media_type === IG_MEDIA.VIDEO || !!node?.video_versions?.length;
+  if (!isVideo) {
+    const still = bestImage(node);
+    return {
+      type: 'image',
+      url: still,
+      thumbnail: still,
+      width: node?.original_width ?? null,
+      height: node?.original_height ?? null,
+      duration: null,
+      formats: [],
+      audio_formats: [],
+      audio_url: '',
+      needs_muxing: false,
+    };
+  }
+
+  // Instagram's own flag, and the ground truth for silence: a reel posted with
+  // no sound has has_audio=false, no audio Representation, and silent
+  // renditions across the board. Muxing is impossible and pointless there.
+  const mediaHasAudio = node?.has_audio !== false;
   const dash = parseDashManifest(node?.video_dash_manifest);
-  const versions = [...(node?.video_versions || [])].sort((a, b) => (a.type || 0) - (b.type || 0));
+
+  /*
+   * `video_versions` are the pre-muxed progressive files (h264 + aac, confirmed
+   * by ffprobe). They carry NO width/height — do not invent them from
+   * original_*, which describes the source upload, not this rendition.
+   *
+   * Instagram returns three entries (type 101/102/103) that are byte-identical
+   * duplicates of one file: same host, same dimensions, same Content-Length.
+   * They are legacy quality slots, not real alternatives. Collapse them to a
+   * single format and keep the spares as `mirrors` for retry/failover.
+   */
+  const byPath = new Map();
+  for (const v of [...(node?.video_versions || [])].sort((a, b) => (a.type || 0) - (b.type || 0))) {
+    if (!v?.url) continue;
+    let path = v.url;
+    try { path = new URL(v.url).pathname; } catch { /* keep the raw string */ }
+    if (byPath.has(path)) byPath.get(path).mirrors.push(v.url);
+    else {
+      byPath.set(path, {
+        quality: null, // Instagram does not label progressive renditions
+        width: v.width ?? null,
+        height: v.height ?? null,
+        bitrate: decodeEfg(v.url)?.bitrate ?? null,
+        codecs: null,
+        mime_type: 'video/mp4',
+        kind: 'progressive',
+        has_audio: mediaHasAudio,
+        url: v.url,
+        mirrors: [],
+      });
+    }
+  }
+  const progressive = [...byPath.values()];
+
+  // Muxed first, so a caller that naively takes formats[0] always gets a file
+  // that plays with sound. Higher-resolution silent renditions follow.
+  const formats = [...progressive, ...dash.video];
+  const playable = formats.find((f) => f.has_audio) || null;
+  // Highest true resolution. Progressive entries have unknown height, so an
+  // adaptive 1080p rendition legitimately outranks them when present.
+  const best = formats.reduce(
+    (a, b) => ((b.height || 0) > (a.height || 0) ? b : a),
+    formats[0] || null,
+  );
 
   return {
-    type: isVideo ? 'video' : 'image',
-    url: isVideo ? versions[0]?.url || dash.formats[0]?.url || null : bestImage(node),
+    type: 'video',
+    url: playable?.url || best?.url || null,
     thumbnail: bestImage(node),
     width: node?.original_width ?? null,
     height: node?.original_height ?? null,
-    duration: isVideo ? dash.duration : null,
-    formats: isVideo ? dash.formats : [],
+    duration: dash.duration ?? decodeEfg(progressive[0]?.url)?.duration_s ?? null,
+    has_audio: mediaHasAudio,
+    formats,
+    audio_formats: dash.audio,
+    audio_url: dash.audio[0]?.url || '',
+    best_video_url: best?.url ?? null,
+    best_video_has_audio: best?.has_audio ?? null,
+    // True only when a silent top rendition CAN be repaired, i.e. a separate
+    // audio stream actually exists to mux against.
+    needs_muxing: Boolean(dash.audio.length) && best?.has_audio === false,
   };
 }
 
@@ -632,6 +767,8 @@ function normaliseInstagram({ product, root, source }, { shortcode, permalink })
   const user = product.user || {};
   const music = product.clips_metadata?.music_info?.music_asset_info || null;
   const originalAudio = product.clips_metadata?.original_sound_info || null;
+  const songUrl = originalAudio?.progressive_download_url
+    || music?.progressive_download_url || '';
 
   return {
     success: true,
@@ -642,8 +779,22 @@ function normaliseInstagram({ product, root, source }, { shortcode, permalink })
     media_type: isCarousel ? 'carousel' : primaryVideo ? 'video' : 'image',
     video_url: primaryVideo?.url ?? null,
     thumbnail: slides[0]?.thumbnail ?? null,
-    media_list: slides.map(({ type: t, url, thumbnail }) => ({ type: t, url, thumbnail })),
+    media_list: slides.map(({ type: t, url, thumbnail, audio_url: a, needs_muxing: n }) => ({
+      type: t, url, thumbnail, ...(t === 'video' ? { audio_url: a, needs_muxing: n } : {}),
+    })),
     formats: primaryVideo?.formats ?? [],
+    audio_formats: primaryVideo?.audio_formats ?? [],
+    /**
+     * Instagram serves its 1080p rendition as a silent video-only stream, so
+     * these three fields tell a caller exactly what it is holding:
+     *   video_url      always muxed and directly playable (720p on IG)
+     *   best_video_url highest resolution, may be silent
+     *   needs_muxing   true when best_video_url must be combined with audio_url
+     */
+    best_video_url: primaryVideo?.best_video_url ?? null,
+    best_video_has_audio: primaryVideo?.best_video_has_audio ?? null,
+    needs_muxing: primaryVideo?.needs_muxing ?? false,
+    has_audio: primaryVideo?.has_audio ?? null,
     caption: product.caption?.text ?? '',
     accessibility_caption: product.accessibility_caption ?? '',
     username: user.username ?? '',
@@ -656,9 +807,21 @@ function normaliseInstagram({ product, root, source }, { shortcode, permalink })
     like_count: product.like_and_view_counts_disabled ? null : product.like_count ?? null,
     comment_count: product.comment_count ?? null,
     reshare_count: product.reshare_count ?? null,
-    audio_url: originalAudio?.progressive_download_url ?? music?.progressive_download_url ?? '',
+    /**
+     * The separated audio TRACK of the video, when the ladder is adaptive.
+     * Prefers the real aac stream over the song's download URL, because that
+     * is what you need to mux against best_video_url.
+     */
+    audio_url: primaryVideo?.audio_url || songUrl,
     audio_title: music?.title ?? originalAudio?.original_audio_title ?? '',
     audio_artist: music?.display_artist ?? originalAudio?.ig_artist?.username ?? '',
+    /** The song/original-sound as a distinct concept from the audio stream. */
+    music: {
+      title: music?.title ?? originalAudio?.original_audio_title ?? '',
+      artist: music?.display_artist ?? originalAudio?.ig_artist?.username ?? '',
+      url: songUrl,
+      is_original_sound: Boolean(originalAudio),
+    },
     is_paid_partnership: product.is_paid_partnership ?? false,
     taken_at: product.taken_at ?? null,
     slide_count: slides.length,
@@ -811,9 +974,15 @@ async function resolveFacebook(url, ctx, env) {
   }
 
   const dash = parseDashManifest(plugin?.dashManifest);
-  const formats = dash.formats.length
-    ? dash.formats
-    : [hd && { quality: 'hd', url: hd }, sd && { quality: 'sd', url: sd }].filter(Boolean);
+
+  // hd_src / sd_src are pre-muxed (ffprobe-confirmed: both carry an aac track),
+  // so they lead. Any adaptive renditions from a DASH manifest follow, flagged.
+  const muxed = [
+    hd && { quality: 'hd', kind: 'progressive', has_audio: true, mime_type: 'video/mp4', url: hd },
+    sd && { quality: 'sd', kind: 'progressive', has_audio: true, mime_type: 'video/mp4', url: sd },
+  ].filter(Boolean);
+  const formats = [...muxed, ...dash.video];
+  const bestVideoFormat = formats[0] || null;
   const thumbnail = page?.thumbnail || plugin?.thumbnail || null;
 
   return {
@@ -825,8 +994,16 @@ async function resolveFacebook(url, ctx, env) {
     media_type: 'video',
     video_url: videoUrl,
     thumbnail,
-    media_list: [{ type: 'video', url: videoUrl, thumbnail }],
+    media_list: [{
+      type: 'video', url: videoUrl, thumbnail,
+      audio_url: dash.audio[0]?.url || '',
+      needs_muxing: Boolean(dash.audio.length) && !bestVideoFormat?.has_audio,
+    }],
     formats,
+    audio_formats: dash.audio,
+    best_video_url: bestVideoFormat?.url ?? null,
+    best_video_has_audio: bestVideoFormat?.has_audio ?? null,
+    needs_muxing: Boolean(dash.audio.length) && !bestVideoFormat?.has_audio,
     caption: page?.caption || page?.title || '',
     accessibility_caption: '',
     username: page?.ownerName || '',
@@ -838,9 +1015,10 @@ async function resolveFacebook(url, ctx, env) {
     like_count: page?.likeCount ?? null,
     comment_count: null,
     reshare_count: null,
-    audio_url: '',
+    audio_url: dash.audio[0]?.url || '',
     audio_title: '',
     audio_artist: '',
+    music: { title: '', artist: '', url: '', is_original_sound: false },
     is_paid_partnership: false,
     taken_at: null,
     slide_count: 1,
@@ -1091,4 +1269,5 @@ export const __internals = {
   shortcodeToPk, pkToShortcode, normaliseInputUrl, parseFacebookVideoId,
   parseInstagramShortcode, extractJsonString, parseDashManifest, parseIsoDuration,
   parseCompactCount, decodeHtmlEntities, normaliseInstagram, extractMetaTag,
+  decodeEfg,
 };
